@@ -1029,8 +1029,6 @@ class os: AllStatic {
   // like ::LinuxUtils
 #if defined(AIX)
   class Aix;
-#elif defined(__IOS__)
-  class Linux;
 #elif defined(BSD)
   class Bsd;
 #elif defined(LINUX)

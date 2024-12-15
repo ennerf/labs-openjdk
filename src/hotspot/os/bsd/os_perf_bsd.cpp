@@ -482,3 +482,4 @@ bool NetworkPerformanceInterface::initialize() {
 int NetworkPerformanceInterface::network_utilization(NetworkInterface** network_interfaces) const {
   return _impl->network_utilization(network_interfaces);
 }
+#endif // IOS
