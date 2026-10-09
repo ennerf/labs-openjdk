@@ -23,6 +23,7 @@
  * questions.
  */
 
+#ifndef __IOS__
 #include <stdbool.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -233,6 +234,7 @@ char *setupMacOSXLocale(int cat) {
     }
 }
 
+#ifndef __IOS__
 void setOSNameAndVersion(java_props_t *sprops) {
     // Hardcode os_name, and fill in os_version
     sprops->os_name = strdup("Mac OS X");
