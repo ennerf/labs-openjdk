@@ -1,0 +1,263 @@
+#
+# Builds the static JDK libraries for the mobile targets, plus the GraalVM C libraries and CAP
+# caches a native image needs for them, for the Oracle GraalVM release whose JDK this branch is.
+# Android cross-compiles on Linux with NDK r29 at API 24, iOS with the runner's default Xcode at
+# iOS 15.0, once for devices and once for the arm64 simulator. The JDK archives come from the
+# module targets (java.base, java.prefs, jdk.net, jdk.management), the whole static-libs-image
+# does not build on Android (libsaproc needs API 28).
+#
+# The CAP caches are generated without running anything on the target: native-image writes the
+# query programs and capgen.py compiles them for the target, reading the values back from the IR.
+#
+# 1) one combined artifact holding every target. A push or a manual run with "publish" also
+#    publishes it and the per-target zips as a GitHub release named <graalvm version>-<commit>
+#
+# 2) one zip per target in the same sdk/ layout as the static JavaFX libs: sdk/lib (archives),
+#    sdk/cap (CAP caches), sdk/legal
+#
+
+name: Static Mobile Libs
+
+# Workflows in new branches don't show up on the Github UI, so we also need a branch trigger
+on:
+  push:
+    branches:
+      - 'build-static*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the combined libraries as a GitHub release
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  GRAALVM_VERSION: 25.4.4.1.1
+  JDK_MODULES: java.base java.prefs jdk.net jdk.management
+  JDK_LIBS: java nio net zip jsig prefs extnet management_ext
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: android-aarch64
+            runner: ubuntu-24.04
+          - target: ios-arm64
+            runner: macos-14
+            sdk: iphoneos
+            min: -miphoneos-version-min=15.0
+            triple: arm64-apple-ios15.0
+          - target: ios-arm64-simulator
+            runner: macos-14
+            sdk: iphonesimulator
+            min: -mios-simulator-version-min=15.0
+            triple: arm64-apple-ios15.0-simulator
+
+    steps:
+      - name: Checkout the source
+        uses: actions/checkout@v4
+        with:
+          path: jdk
+
+      - name: Checkout the GraalVM C libraries
+        uses: actions/checkout@v4
+        with:
+          repository: oracle/graal
+          ref: vm-${{ env.GRAALVM_VERSION }}
+          path: graal
+          sparse-checkout: |
+            substratevm/src/com.oracle.svm.native.libchelper
+            substratevm/src/com.oracle.svm.native.jvm.posix
+            substratevm/src/com.oracle.svm.native.libcontainer
+            substratevm/src/com.oracle.svm.native.darwin
+
+      # The boot JDK, and native-image for the CAP query programs. The action only takes the
+      # feature release, so the exact version is checked
+      - name: Setup GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          version: '25.4'
+          distribution: graalvm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check the GraalVM version
+        shell: bash
+        run: |
+          set -x
+          version=$(sed -n 's/^GRAALVM_VERSION="\(.*\)"$/\1/p' "$GRAALVM_HOME/release")
+          if [ "$version" != "$GRAALVM_VERSION" ]; then
+            echo "::error::setup-graalvm installed GraalVM $version, this branch is the JDK of $GRAALVM_VERSION"
+            exit 1
+          fi
+
+      - name: Install dependencies (Android)
+        if: matrix.target == 'android-aarch64'
+        shell: bash
+        run: |
+          set -x
+          sudo apt-get update
+          sudo apt-get install -y autoconf libcups2-dev libasound2-dev libfontconfig1-dev libx11-dev libxext-dev libxrender-dev libxrandr-dev libxtst-dev libxt-dev
+          curl -sSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+          unzip -q ndk.zip -d "$RUNNER_TEMP" && rm ndk.zip
+          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r29" >> "$GITHUB_ENV"
+
+      # configure needs the CUPS headers even for a headless build, iOS has none
+      - name: Install dependencies (iOS)
+        if: startsWith(matrix.target, 'ios-')
+        shell: bash
+        run: |
+          set -x
+          brew install autoconf make
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          curl -sSL -o cups.zip https://github.com/apple/cups/archive/refs/tags/v2.3.6.zip
+          unzip -q cups.zip -d "$RUNNER_TEMP" && rm cups.zip
+          xcodebuild -version
+
+      - name: Configure
+        working-directory: jdk
+        shell: bash
+        run: |
+          set -x
+          common="--with-conf-name=${{ matrix.target }} --enable-headless-only --with-boot-jdk=$GRAALVM_HOME --with-jvm-variants=minimal
+            --disable-warnings-as-errors --with-native-debug-symbols=none --disable-precompiled-headers"
+          if [ "${{ matrix.target }}" = "android-aarch64" ]; then
+            toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+            bash configure $common --with-toolchain-type=clang --with-toolchain-path="$toolchain/bin" --with-sysroot="$toolchain/sysroot" \
+              --build=x86_64-pc-linux-gnu --host=aarch64-linux-android --target=aarch64-linux-android
+          else
+            bash configure $common --openjdk-target=aarch64-macos-ios --with-cups-include="$RUNNER_TEMP/cups-2.3.6" \
+              --with-sysroot="$(xcrun --sdk ${{ matrix.sdk }} --show-sdk-path)" \
+              --with-extra-cflags=${{ matrix.min }} --with-extra-cxxflags=${{ matrix.min }} --with-extra-ldflags=${{ matrix.min }}
+          fi
+
+      - name: Build the static JDK libraries
+        working-directory: jdk
+        shell: bash
+        run: |
+          set -x
+          make CONF=${{ matrix.target }} $(for m in $JDK_MODULES; do echo $m-static-libs; done)
+
+      - name: Build the GraalVM C libraries
+        shell: bash
+        run: |
+          set -x
+          lib="out/${{ matrix.target }}/sdk/lib"
+          mkdir -p "$lib"
+          for l in $JDK_LIBS; do
+            cp jdk/build/${{ matrix.target }}/support/native/*/lib$l/static/lib$l.a "$lib/"
+          done
+          bash jdk/.github/mobile/svm-libs.sh ${{ matrix.target }} graal jdk "$lib"
+          ls -l "$lib"
+
+      # Android images only build on a Linux host. The probe takes the flags of a real build, so the
+      # cross-arch FFM ABI comes from CABI on Android, iOS runs on an arm64 Mac
+      - name: Generate the CAP caches
+        shell: bash
+        run: |
+          set -x
+          probe="$RUNNER_TEMP/probe"
+          mkdir -p "$probe/classes"
+          javac -d "$probe/classes" jdk/.github/mobile/Probe.java
+          if [ "${{ matrix.target }}" = "android-aarch64" ]; then
+            platform=ANDROID_AARCH64
+            target_args="-Dsvm.targetArch=aarch64 -J-Djdk.internal.foreign.CABI=LINUX_AARCH_64"
+            clang="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+            cflags="--target=aarch64-linux-android24 -I$GRAALVM_HOME/include -I$GRAALVM_HOME/include/linux"
+          else
+            platform=IOS_AARCH64
+            target_args="-Dsvm.targetName=iOS -Dsvm.targetArch=arm64 -H:PageSize=16384"
+            clang=$(xcrun -sdk ${{ matrix.sdk }} -f clang)
+            cflags="-ObjC -target ${{ matrix.triple }} -isysroot $(xcrun --sdk ${{ matrix.sdk }} --show-sdk-path) -I$GRAALVM_HOME/include -I$GRAALVM_HOME/include/darwin"
+          fi
+          (cd "$probe" && native-image --shared -cp classes -o probe "-Dsvm.platform=org.graalvm.nativeimage.Platform\$$platform" $target_args \
+            -H:+UnlockExperimentalVMOptions -H:+ForeignAPISupport -H:+ExitAfterQueryCodeGeneration -H:QueryCodeDir="$probe/query")
+          python3 jdk/.github/mobile/capgen.py "$clang" "$probe/query" "$probe/cap" $cflags
+          mkdir -p out/${{ matrix.target }}/sdk/cap
+          cp "$probe"/cap/*.cap out/${{ matrix.target }}/sdk/cap/
+          ls -l out/${{ matrix.target }}/sdk/cap
+
+      - name: Collect the legal texts
+        shell: bash
+        run: |
+          set -x
+          legal="out/${{ matrix.target }}/sdk/legal"
+          for m in $JDK_MODULES; do
+            mkdir -p "$legal/$m"
+            cp jdk/LICENSE jdk/ASSEMBLY_EXCEPTION jdk/ADDITIONAL_LICENSE_INFO "$legal/$m/"
+            for d in share unix; do
+              if [ -d "jdk/src/$m/$d/legal" ]; then cp jdk/src/$m/$d/legal/* "$legal/$m/"; fi
+            done
+          done
+          mkdir -p "$legal/substratevm"
+          cp graal/substratevm/LICENSE "$legal/substratevm/"
+
+      - name: Package the libraries
+        id: package
+        working-directory: out/${{ matrix.target }}
+        shell: bash
+        run: |
+          set -x
+          zip_name="graalvm-$GRAALVM_VERSION-${{ matrix.target }}-static.zip"
+          zip -qr "../$zip_name" sdk
+          ls -l "../$zip_name"
+          echo "zip_name=$zip_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: out/${{ steps.package.outputs.zip_name }}
+          compression-level: 0
+          if-no-files-found: error
+
+  # Combines the libraries of every target into a single artifact
+  combine:
+    name: combined
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download every target
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble one tree
+        shell: bash
+        run: |
+          set -x
+          for dir in artifacts/*/; do
+            target=$(basename "$dir")
+            mkdir -p "combined/$target"
+            unzip -q "$dir"/*.zip -d "combined/$target"
+          done
+          du -sh combined
+
+      - name: Upload the combined libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: graalvm-${{ env.GRAALVM_VERSION }}-static
+          path: combined
+          if-no-files-found: error
+
+      # The combined zip has the hash in its name so a stale download is never reused
+      - name: Publish the release
+        if: inputs.publish || github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -x
+          tag="$GRAALVM_VERSION-${GITHUB_SHA::10}"
+          zip_name="graalvm-$tag-static.zip"
+          (cd combined && zip -qr "../$zip_name" .)
+          gh release create "$tag" "$zip_name" artifacts/*/*.zip --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Static mobile libraries $GRAALVM_VERSION ($GITHUB_REF_NAME)" \
+            --notes "Static JDK and GraalVM C libraries and CAP caches for the mobile targets, built from $GITHUB_SHA on $GITHUB_REF_NAME."
