@@ -101,7 +101,7 @@ AC_DEFUN([FLAGS_SETUP_DEBUG_SYMBOLS],
   DEBUG_PREFIX_CFLAGS=
 
   # Debug symbols
-  if test "x$TOOLCHAIN_TYPE" = xgcc; then
+  if test "x$TOOLCHAIN_TYPE" = xgcc || test "x$OPENJDK_TARGET_OS" = xandroid; then
     if test "x$ALLOW_ABSOLUTE_PATHS_IN_OUTPUT" = "xfalse"; then
       # Check if compiler supports -fdebug-prefix-map. If so, use that to make
       # the debug symbol paths resolve to paths relative to the workspace root.

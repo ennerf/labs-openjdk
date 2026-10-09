@@ -1186,7 +1186,7 @@ void CompilationMemoryStatisticDCmd::execute(DCmdSource source, TRAPS) {
   CompilationMemoryStatistic::print_jcmd_report(output(), _verbose.value(), _legend.value(), minsize);
 }
 
-#if defined(LINUX) || defined(_WIN64) || defined(__APPLE__)
+#if defined(LINUX) || defined(_WIN64) || (defined(__APPLE__) && !defined(__IOS__))
 
 SystemMapDCmd::SystemMapDCmd(outputStream* output, bool heap) : DCmd(output, heap) {}
 

@@ -21,6 +21,7 @@
  * questions.
  *
  */
+#ifndef __IOS__
 #include "memory/allocation.inline.hpp"
 #include "memory/resourceArea.hpp"
 #include "runtime/os.hpp"
