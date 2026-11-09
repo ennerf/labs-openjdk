@@ -29,6 +29,7 @@ on:
   push:
     branches-ignore:
       - pr/*
+      - build-static*
   workflow_dispatch:
     inputs:
       platforms:
