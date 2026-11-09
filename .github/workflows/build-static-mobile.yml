@@ -34,7 +34,7 @@ permissions:
   contents: read
 
 env:
-  GRAALVM_VERSION: 25.4.4.1.1
+  GRAALVM_VERSION: 25.5.5.0.3
   JDK_MODULES: java.base java.prefs jdk.net jdk.management
   JDK_LIBS: java nio net zip jsig prefs extnet management_ext
 
@@ -82,7 +82,7 @@ jobs:
       - name: Setup GraalVM
         uses: graalvm/setup-graalvm@v1
         with:
-          version: '25.4'
+          version: '25.5'
           distribution: graalvm
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
