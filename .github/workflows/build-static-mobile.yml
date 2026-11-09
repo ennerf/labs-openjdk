@@ -1,8 +1,9 @@
 #
-# Builds the static JDK libraries for the mobile targets with build-android.yml and build-ios.yml,
-# then packs each target with the GraalVM C libraries and CAP caches a native image needs, for the
-# Oracle GraalVM release whose JDK this branch is. Each target is packed by
-# .github/mobile/package-target.sh, which also runs locally.
+# Builds the static JDK libraries for the mobile targets, then packs each target with the GraalVM C
+# libraries and CAP caches a native image needs, for the Oracle GraalVM release whose JDK this
+# branch is. Android is built by build-android.yml; iOS builds the device and the simulator SDK in
+# one job with the configure line of build-ios.yml, so the release needs a single macOS runner.
+# Each target is packed by .github/mobile/package-target.sh, which also runs locally.
 #
 # 1) one combined artifact holding every target. A push or a manual run with "publish" also
 #    publishes it and the per-target zips as a GitHub release named <graalvm version>-<commit>
@@ -40,42 +41,10 @@ jobs:
       ndk-version: 'r29'
       api-level: '28'
 
-  build-ios-aarch64:
-    name: ios-aarch64
-    uses: ./.github/workflows/build-ios.yml
-    with:
-      platform: ios-aarch64
-      runs-on: 'macos-15'
-      sdk-name: iphoneos
-      xcode-toolset-version: '16.4'
-
-  build-ios-aarch64-simulator:
-    name: ios-aarch64-simulator
-    uses: ./.github/workflows/build-ios.yml
-    with:
-      platform: ios-aarch64-simulator
-      runs-on: 'macos-15'
-      sdk-name: iphonesimulator
-      xcode-toolset-version: '16.4'
-
-  package:
-    name: package ${{ matrix.target }}
-    needs: [build-android-aarch64, build-ios-aarch64, build-ios-aarch64-simulator]
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: android-aarch64
-            platform: android-aarch64
-            runner: ubuntu-24.04
-          - target: ios-arm64
-            platform: ios-aarch64
-            runner: macos-15
-          - target: ios-arm64-simulator
-            platform: ios-aarch64-simulator
-            runner: macos-15
-
+  android:
+    name: package android-aarch64
+    needs: build-android-aarch64
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout the source
         uses: actions/checkout@v6
@@ -113,8 +82,7 @@ jobs:
             exit 1
           fi
 
-      - name: Install the NDK (Android)
-        if: matrix.target == 'android-aarch64'
+      - name: Install the NDK
         shell: bash
         run: |
           set -x
@@ -122,27 +90,90 @@ jobs:
           unzip -q ndk.zip -d "$RUNNER_TEMP" && rm ndk.zip
           echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r29" >> "$GITHUB_ENV"
 
-      - name: Select Xcode (iOS)
-        if: matrix.target != 'android-aarch64'
-        shell: bash
-        run: |
-          sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
-          xcodebuild -version
-
       - name: Download the bundles
         uses: actions/download-artifact@v8
         with:
-          name: bundles-${{ matrix.platform }}
+          name: bundles-android-aarch64
           path: bundles
 
       - name: Pack the libraries
         shell: bash
-        run: bash jdk/.github/mobile/package-target.sh ${{ matrix.target }} bundles/static-libs-graal-${{ matrix.platform }}.tar.gz jdk graal out
+        run: bash jdk/.github/mobile/package-target.sh android-aarch64 bundles/static-libs-graal-android-aarch64.tar.gz jdk graal out
 
       - name: Upload the libraries
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.target }}
+          name: android
+          path: out/*.zip
+          compression-level: 0
+          if-no-files-found: error
+
+  ios:
+    name: ios-arm64 + ios-arm64-simulator
+    runs-on: macos-15
+    steps:
+      - name: Checkout the source
+        uses: actions/checkout@v6
+        with:
+          path: jdk
+
+      - name: Checkout the GraalVM C libraries
+        uses: actions/checkout@v6
+        with:
+          repository: oracle/graal
+          ref: vm-${{ env.GRAALVM_VERSION }}
+          path: graal
+          sparse-checkout: |
+            substratevm/LICENSE
+            substratevm/src/com.oracle.svm.native.libchelper
+            substratevm/src/com.oracle.svm.native.jvm.posix
+            substratevm/src/com.oracle.svm.native.libcontainer
+            substratevm/src/com.oracle.svm.native.darwin
+
+      # The action only takes the feature release, so the exact version is checked
+      - name: Setup GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          version: '25.5'
+          distribution: graalvm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check the GraalVM version
+        shell: bash
+        run: |
+          set -x
+          version=$(sed -n 's/^GRAALVM_VERSION="\(.*\)"$/\1/p' "$GRAALVM_HOME/release")
+          if [ "$version" != "$GRAALVM_VERSION" ]; then
+            echo "::error::setup-graalvm installed GraalVM $version, this branch is the JDK of $GRAALVM_VERSION"
+            exit 1
+          fi
+
+      - name: Install toolchain and dependencies
+        shell: bash
+        run: |
+          brew install autoconf make
+          sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Build and pack the libraries
+        shell: bash
+        run: |
+          set -x
+          cd jdk
+          for build in "ios-aarch64 iphoneos ios-arm64" "ios-aarch64-simulator iphonesimulator ios-arm64-simulator"; do
+            set -- $build
+            bash configure --with-conf-name=$1 --with-version-opt=${GITHUB_ACTOR}-${GITHUB_SHA} \
+              --with-boot-jdk="$GRAALVM_HOME" --openjdk-target=aarch64-apple-darwin --with-sdk-name=$2 \
+              --with-zlib=system --with-jvm-variants=minimal || (cat config.log && exit 1)
+            make CONF=$1 LOG=info static-libs-graal-bundles
+            bash .github/mobile/package-target.sh $3 build/$1/bundles/jdk-*_bin-static-libs-graal.tar.gz . ../graal ../out
+          done
+
+      - name: Upload the libraries
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios
           path: out/*.zip
           compression-level: 0
           if-no-files-found: error
@@ -150,7 +181,7 @@ jobs:
   # Combines the libraries of every target into a single artifact
   combine:
     name: combined
-    needs: package
+    needs: [android, ios]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -159,7 +190,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts
-          pattern: '{android,ios}-*'
+          pattern: '{android,ios}'
 
       - name: Assemble one tree
         shell: bash
