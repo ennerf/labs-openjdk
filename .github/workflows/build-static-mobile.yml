@@ -1,0 +1,227 @@
+#
+# Builds the static JDK libraries for the mobile targets, then packs each target with the GraalVM C
+# libraries and CAP caches a native image needs, for the Oracle GraalVM release whose JDK this
+# branch is. Android is built by build-android.yml; iOS builds the device and the simulator SDK in
+# one job with the configure line of build-ios.yml, so the release needs a single macOS runner.
+# Each target is packed by .github/mobile/package-target.sh, which also runs locally.
+#
+# 1) one combined artifact holding every target. A push or a manual run with "publish" also
+#    publishes it and the per-target zips as a GitHub release named <graalvm version>-<commit>
+#
+# 2) one zip per target in the same sdk/ layout as the static JavaFX libs: sdk/lib (archives),
+#    sdk/cap (CAP caches), sdk/legal
+#
+
+name: Static Mobile Libs
+
+# Workflows in new branches don't show up on the Github UI, so we also need a branch trigger
+on:
+  push:
+    branches:
+      - 'build-static*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the combined libraries as a GitHub release
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  GRAALVM_VERSION: 25.5.5.0.3
+
+jobs:
+  build-android-aarch64:
+    name: android-aarch64
+    uses: ./.github/workflows/build-android.yml
+    with:
+      platform: android-aarch64
+      ndk-version: 'r29'
+      api-level: '28'
+
+  android:
+    name: package android-aarch64
+    needs: build-android-aarch64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout the source
+        uses: actions/checkout@v6
+        with:
+          path: jdk
+
+      - name: Checkout the GraalVM C libraries
+        uses: actions/checkout@v6
+        with:
+          repository: oracle/graal
+          ref: vm-${{ env.GRAALVM_VERSION }}
+          path: graal
+          sparse-checkout: |
+            substratevm/LICENSE
+            substratevm/src/com.oracle.svm.native.libchelper
+            substratevm/src/com.oracle.svm.native.jvm.posix
+            substratevm/src/com.oracle.svm.native.libcontainer
+            substratevm/src/com.oracle.svm.native.darwin
+
+      # The action only takes the feature release, so the exact version is checked
+      - name: Setup GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          version: '25.5'
+          distribution: graalvm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check the GraalVM version
+        shell: bash
+        run: |
+          set -x
+          version=$(sed -n 's/^GRAALVM_VERSION="\(.*\)"$/\1/p' "$GRAALVM_HOME/release")
+          if [ "$version" != "$GRAALVM_VERSION" ]; then
+            echo "::error::setup-graalvm installed GraalVM $version, this branch is the JDK of $GRAALVM_VERSION"
+            exit 1
+          fi
+
+      - name: Install the NDK
+        shell: bash
+        run: |
+          set -x
+          curl -sSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+          unzip -q ndk.zip -d "$RUNNER_TEMP" && rm ndk.zip
+          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r29" >> "$GITHUB_ENV"
+
+      - name: Download the bundles
+        uses: actions/download-artifact@v8
+        with:
+          name: bundles-android-aarch64
+          path: bundles
+
+      - name: Pack the libraries
+        shell: bash
+        run: bash jdk/.github/mobile/package-target.sh android-aarch64 bundles/static-libs-graal-android-aarch64.tar.gz jdk graal out
+
+      - name: Upload the libraries
+        uses: actions/upload-artifact@v6
+        with:
+          name: android
+          path: out/*.zip
+          compression-level: 0
+          if-no-files-found: error
+
+  ios:
+    name: ios-arm64 + ios-arm64-simulator
+    runs-on: macos-15
+    steps:
+      - name: Checkout the source
+        uses: actions/checkout@v6
+        with:
+          path: jdk
+
+      - name: Checkout the GraalVM C libraries
+        uses: actions/checkout@v6
+        with:
+          repository: oracle/graal
+          ref: vm-${{ env.GRAALVM_VERSION }}
+          path: graal
+          sparse-checkout: |
+            substratevm/LICENSE
+            substratevm/src/com.oracle.svm.native.libchelper
+            substratevm/src/com.oracle.svm.native.jvm.posix
+            substratevm/src/com.oracle.svm.native.libcontainer
+            substratevm/src/com.oracle.svm.native.darwin
+
+      # The action only takes the feature release, so the exact version is checked
+      - name: Setup GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          version: '25.5'
+          distribution: graalvm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check the GraalVM version
+        shell: bash
+        run: |
+          set -x
+          version=$(sed -n 's/^GRAALVM_VERSION="\(.*\)"$/\1/p' "$GRAALVM_HOME/release")
+          if [ "$version" != "$GRAALVM_VERSION" ]; then
+            echo "::error::setup-graalvm installed GraalVM $version, this branch is the JDK of $GRAALVM_VERSION"
+            exit 1
+          fi
+
+      - name: Install toolchain and dependencies
+        shell: bash
+        run: |
+          brew install autoconf make
+          sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Build and pack the libraries
+        shell: bash
+        run: |
+          set -x
+          cd jdk
+          for build in "ios-aarch64 iphoneos ios-arm64" "ios-aarch64-simulator iphonesimulator ios-arm64-simulator"; do
+            set -- $build
+            bash configure --with-conf-name=$1 --with-version-opt=${GITHUB_ACTOR}-${GITHUB_SHA} \
+              --with-boot-jdk="$GRAALVM_HOME" --openjdk-target=aarch64-apple-darwin --with-sdk-name=$2 \
+              --with-zlib=system --with-jvm-variants=minimal || (cat config.log && exit 1)
+            make CONF=$1 LOG=info static-libs-graal-bundles
+            bash .github/mobile/package-target.sh $3 build/$1/bundles/jdk-*_bin-static-libs-graal.tar.gz . ../graal ../out
+          done
+
+      - name: Upload the libraries
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios
+          path: out/*.zip
+          compression-level: 0
+          if-no-files-found: error
+
+  # Combines the libraries of every target into a single artifact
+  combine:
+    name: combined
+    needs: [android, ios]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download every target
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: '{android,ios}'
+
+      - name: Assemble one tree
+        shell: bash
+        run: |
+          set -x
+          for zip in artifacts/*/*.zip; do
+            target=$(basename "$zip" -static.zip)
+            target=${target#graalvm-$GRAALVM_VERSION-}
+            mkdir -p "combined/$target"
+            unzip -q "$zip" -d "combined/$target"
+          done
+          du -sh combined
+
+      - name: Upload the combined libraries
+        uses: actions/upload-artifact@v6
+        with:
+          name: graalvm-${{ env.GRAALVM_VERSION }}-static
+          path: combined
+          if-no-files-found: error
+
+      # The combined zip has the hash in its name so a stale download is never reused
+      - name: Publish the release
+        if: inputs.publish || github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -x
+          tag="$GRAALVM_VERSION-${GITHUB_SHA::10}"
+          zip_name="graalvm-$tag-static.zip"
+          (cd combined && zip -qr "../$zip_name" .)
+          gh release create "$tag" "$zip_name" artifacts/*/*.zip --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Static mobile libraries $GRAALVM_VERSION ($GITHUB_REF_NAME)" \
+            --notes "Static JDK and GraalVM C libraries and CAP caches for the mobile targets, built from $GITHUB_SHA on $GITHUB_REF_NAME."
