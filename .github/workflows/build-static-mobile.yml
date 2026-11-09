@@ -1,0 +1,169 @@
+#
+# Builds the static JDK libraries for the mobile targets, plus the GraalVM C libraries and CAP
+# caches a native image needs for them, for the Oracle GraalVM release whose JDK this branch is.
+# Android cross-compiles on Linux with NDK r29 at API 24, iOS with the runner's default Xcode at
+# iOS 15.0, devices and the arm64 simulator one after the other in one job. Each target is built
+# by .github/mobile/build-target.sh, which also runs locally.
+#
+# 1) one combined artifact holding every target. A push or a manual run with "publish" also
+#    publishes it and the per-target zips as a GitHub release named <graalvm version>-<commit>
+#
+# 2) one zip per target in the same sdk/ layout as the static JavaFX libs: sdk/lib (archives),
+#    sdk/cap (CAP caches), sdk/legal
+#
+
+name: Static Mobile Libs
+
+# Workflows in new branches don't show up on the Github UI, so we also need a branch trigger
+on:
+  push:
+    branches:
+      - 'build-static*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the combined libraries as a GitHub release
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  GRAALVM_VERSION: 25.5.5.0.3
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: android
+            runner: ubuntu-24.04
+            targets: android-aarch64
+          - name: ios
+            runner: macos-15
+            targets: ios-arm64 ios-arm64-simulator
+
+    steps:
+      - name: Checkout the source
+        uses: actions/checkout@v4
+        with:
+          path: jdk
+
+      - name: Checkout the GraalVM C libraries
+        uses: actions/checkout@v4
+        with:
+          repository: oracle/graal
+          ref: vm-${{ env.GRAALVM_VERSION }}
+          path: graal
+          sparse-checkout: |
+            substratevm/src/com.oracle.svm.native.libchelper
+            substratevm/src/com.oracle.svm.native.jvm.posix
+            substratevm/src/com.oracle.svm.native.libcontainer
+            substratevm/src/com.oracle.svm.native.darwin
+
+      # The action only takes the feature release, so the exact version is checked
+      - name: Setup GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          version: '25.5'
+          distribution: graalvm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check the GraalVM version
+        shell: bash
+        run: |
+          set -x
+          version=$(sed -n 's/^GRAALVM_VERSION="\(.*\)"$/\1/p' "$GRAALVM_HOME/release")
+          if [ "$version" != "$GRAALVM_VERSION" ]; then
+            echo "::error::setup-graalvm installed GraalVM $version, this branch is the JDK of $GRAALVM_VERSION"
+            exit 1
+          fi
+
+      - name: Install dependencies (Android)
+        if: matrix.name == 'android'
+        shell: bash
+        run: |
+          set -x
+          sudo apt-get update
+          sudo apt-get install -y autoconf libcups2-dev libasound2-dev libfontconfig1-dev libx11-dev libxext-dev libxrender-dev libxrandr-dev libxtst-dev libxt-dev
+          curl -sSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+          unzip -q ndk.zip -d "$RUNNER_TEMP" && rm ndk.zip
+          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r29" >> "$GITHUB_ENV"
+
+      - name: Install dependencies (iOS)
+        if: matrix.name == 'ios'
+        shell: bash
+        run: |
+          set -x
+          brew install autoconf make
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          curl -sSL -o cups.zip https://github.com/apple/cups/archive/refs/tags/v2.3.6.zip
+          unzip -q cups.zip -d "$RUNNER_TEMP" && rm cups.zip
+          echo "CUPS_INCLUDE=$RUNNER_TEMP/cups-2.3.6" >> "$GITHUB_ENV"
+          xcodebuild -version
+
+      - name: Build the libraries
+        shell: bash
+        run: |
+          for target in ${{ matrix.targets }}; do
+            bash jdk/.github/mobile/build-target.sh $target jdk graal out
+          done
+
+      - name: Upload the libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: out/*.zip
+          compression-level: 0
+          if-no-files-found: error
+
+  # Combines the libraries of every target into a single artifact
+  combine:
+    name: combined
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download every target
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble one tree
+        shell: bash
+        run: |
+          set -x
+          for zip in artifacts/*/*.zip; do
+            target=$(basename "$zip" -static.zip)
+            target=${target#graalvm-$GRAALVM_VERSION-}
+            mkdir -p "combined/$target"
+            unzip -q "$zip" -d "combined/$target"
+          done
+          du -sh combined
+
+      - name: Upload the combined libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: graalvm-${{ env.GRAALVM_VERSION }}-static
+          path: combined
+          if-no-files-found: error
+
+      # The combined zip has the hash in its name so a stale download is never reused
+      - name: Publish the release
+        if: inputs.publish || github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -x
+          tag="$GRAALVM_VERSION-${GITHUB_SHA::10}"
+          zip_name="graalvm-$tag-static.zip"
+          (cd combined && zip -qr "../$zip_name" .)
+          gh release create "$tag" "$zip_name" artifacts/*/*.zip --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Static mobile libraries $GRAALVM_VERSION ($GITHUB_REF_NAME)" \
+            --notes "Static JDK and GraalVM C libraries and CAP caches for the mobile targets, built from $GITHUB_SHA on $GITHUB_REF_NAME."
