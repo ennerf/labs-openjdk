@@ -49,12 +49,12 @@ jobs:
           - target: android-aarch64
             runner: ubuntu-24.04
           - target: ios-arm64
-            runner: macos-14
+            runner: macos-15
             sdk: iphoneos
             min: -miphoneos-version-min=15.0
             triple: arm64-apple-ios15.0
           - target: ios-arm64-simulator
-            runner: macos-14
+            runner: macos-15
             sdk: iphonesimulator
             min: -mios-simulator-version-min=15.0
             triple: arm64-apple-ios15.0-simulator
